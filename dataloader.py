@@ -8,10 +8,34 @@ from torchvision.transforms.functional import crop
 import torch
 
 
-class FluxKontext(Dataset):
+class FluxKontextDataset(Dataset):
+
     """
-    Dataset that yields (source_image, target_image, prompt) triplets
-    ready for Flux-Kontext edit fine-tuning.
+    Flux-Kontext paired‑image dataset
+    ================================
+
+    Yields dictionaries with keys:
+        src_pixels : tensor (3,H,W)   # un-noised conditioning image
+        tgt_pixels : tensor (3,H,W)   # target / ground-truth edited image
+        prompt     : str
+        bucket_idx : int
+
+    Expected ``args`` attributes
+    ---------------------------
+    - **Dataset loading**
+        - ``dataset_name``              (str, required)
+        - ``dataset_config_name``       (str | None)
+        - ``cache_dir``                 (str | None)
+        - ``source_image_column``       (str, required)
+        - ``target_image_column``       (str, required)
+        - ``caption_column``            (str | None)
+    - **Image processing**
+        - ``resolution``                (int, default 512)
+        - ``aspect_ratio_buckets``      (str | None)  e.g. "(512,512),(768,512)"
+        - ``random_flip``               (bool)
+        - ``center_crop``               (bool)
+
+
     """
 
     def __init__(
@@ -76,53 +100,48 @@ class FluxKontext(Dataset):
         logging.info(f"Using aspect-ratio buckets: {self.buckets}")
 
         # ---------------------------------------------------------------------
-        # 2.  Pre-process every pair once so __getitem__ is cheap
+        # 2.  Pre-process every pair once
         # ---------------------------------------------------------------------
         self.src_pixel_values, self.tgt_pixel_values, self.bucket_ids = [], [], []
 
-        # build transforms ***once*** per dataset ─ identical params for both imgs
         for idx, (src_pil, tgt_pil) in enumerate(zip(self.src_imgs, self.tgt_imgs)):
-            # repeat K times for class-balancing
             for _ in range(repeats):
-                src_pil = exif_transpose(src_pil)
-                tgt_pil = exif_transpose(tgt_pil)
 
-                if src_pil.mode != "RGB":
-                    src_pil = src_pil.convert("RGB")
-                if tgt_pil.mode != "RGB":
-                    tgt_pil = tgt_pil.convert("RGB")
 
-                # choose bucket by *target* image (any strategy is OK as long as consistent)
-                h, w = tgt_pil.size[1], tgt_pil.size[0]
-                bucket_idx = find_nearest_bucket(h, w, self.buckets)
-                tgt_h, tgt_w = self.buckets[bucket_idx]
-                size = (tgt_h, tgt_w)
+                src_pil, tgt_pil = map(exif_transpose, (src_pil, tgt_pil))
+                if src_pil.mode != "RGB": src_pil = src_pil.convert("RGB")
+                if tgt_pil.mode != "RGB": tgt_pil = tgt_pil.convert("RGB")
 
-                # record so we can debug later
+                # bucket choice (based on *target* shape) ---------------------------
+                h, w          = tgt_pil.size[1], tgt_pil.size[0]
+                bucket_idx    = find_nearest_bucket(h, w, self.buckets)
+                tgt_h, tgt_w  = self.buckets[bucket_idx]
+                size          = (tgt_h, tgt_w)
                 self.bucket_ids.append(bucket_idx)
 
-                resize = transforms.Resize(size, transforms.InterpolationMode.BILINEAR)
-                crop_fn = (transforms.CenterCrop(size) if center_crop
-                           else transforms.RandomCrop(size))
-                flip_fn = transforms.RandomHorizontalFlip(p=1.0)
+                # transforms shared by both images ---------------------------------
+                resize   = transforms.Resize(size, transforms.InterpolationMode.BILINEAR)
+                crop_fn  = transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size)
+                flip_fn  = transforms.RandomHorizontalFlip(p=1.0)
                 to_tensor = transforms.Compose([
                     transforms.ToTensor(),
                     transforms.Normalize([0.5], [0.5]),
                 ])
 
-                def process(img):
+                # **decide once for the pair**
+                do_flip = args.random_flip and random.random() < 0.5
+
+                def process(img, *, flip):
                     img = resize(img)
                     if center_crop:
                         img = crop_fn(img)
-                    else:
-                        y1, x1, h_, w_ = crop_fn.get_params(img, size)
-                        img = crop(img, y1, x1, h_, w_)
-                    if args.random_flip and random.random() < 0.5:
+
+                    if flip:
                         img = flip_fn(img)
                     return to_tensor(img)
 
-                self.src_pixel_values.append(process(src_pil))
-                self.tgt_pixel_values.append(process(tgt_pil))
+                self.src_pixel_values.append(process(src_pil, flip=do_flip))
+                self.tgt_pixel_values.append(process(tgt_pil, flip=do_flip))
 
         # ---------------------------------------------------------------------
         # 3.  Optional caption expansion
@@ -206,7 +225,7 @@ def get_args():
 
     p.add_argument("--resolution", type=int, default=512)
     p.add_argument("--aspect_ratio_buckets", default="1184,880")
-    p.add_argument("--random_flip", action="store_true")
+    p.add_argument("--random_flip", action="store_true", default=True)
 
     p.add_argument("--instance_prompt", default="photo")
     p.add_argument("--repeats", type=int, default=1)
@@ -220,7 +239,7 @@ def main():
     # -----------------------------------------------------------------
     # 2.  Build dataset & take first five items
     # -----------------------------------------------------------------
-    ds = FluxKontext(args=args, split="train",
+    ds = FluxKontextDataset(args=args, split="train",
                      repeats=args.repeats,
                      center_crop=args.center_crop)
 
